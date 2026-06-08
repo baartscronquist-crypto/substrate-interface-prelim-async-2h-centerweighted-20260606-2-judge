@@ -27,17 +27,17 @@ import numpy as np
 DEFAULT_WEIGHTS = {
     "criterion_01": 10.0,
     "criterion_02": 8.0,
-    "criterion_03": 35.0,
+    "criterion_03": 12.0,
     "criterion_04": 8.0,
-    "criterion_05": 14.0,
+    "criterion_05": 10.0,
     "criterion_06": 6.0,
     "criterion_07": 8.0,
     "criterion_08": 6.0,
     "criterion_09": 5.0,
-    "criterion_10": 8.0,
+    "criterion_10": 9.0,
     "criterion_11": 8.0,
-    "criterion_12": 8.0,
-    "criterion_13": 8.0,
+    "criterion_12": 5.0,
+    "criterion_13": 5.0,
 }
 
 
@@ -396,6 +396,29 @@ def _write_private_score(result: dict[str, Any]) -> None:
     except OSError:
         # Private telemetry must never perturb visible grading.
         pass
+
+
+def _public_feedback_lines(result: dict[str, Any]) -> list[str]:
+    checks = result.get("checks") or {}
+    if not checks:
+        return [
+            "PUBLIC_DIAGNOSTICS:",
+            "  model_execution=needs_work",
+            "  note=no scores, thresholds, hidden metrics, or model-specific field names are reported",
+        ]
+
+    def status(*names: str) -> str:
+        return "ok" if all(bool(checks.get(name, False)) for name in names) else "needs_work"
+
+    return [
+        "PUBLIC_DIAGNOSTICS:",
+        f"  response_observable={status('criterion_01', 'criterion_02')}",
+        f"  spatial_scalar_trend={status('criterion_03', 'criterion_04', 'criterion_05', 'criterion_06', 'criterion_07', 'criterion_08', 'criterion_09')}",
+        f"  continuum_field_structure={status('criterion_10', 'criterion_12')}",
+        f"  local_diagnostic_consistency={status('criterion_11')}",
+        f"  temporal_modulation={status('criterion_13')}",
+        "  note=no scores, thresholds, hidden metrics, or model-specific field names are reported",
+    ]
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
@@ -797,6 +820,8 @@ def main() -> int:
     cases_ok = 1 if passed else 0
     print("=" * 40)
     print(f"RESULT: {verdict}")
+    for line in _public_feedback_lines(result):
+        print(line)
     print(f"CASE visible {case_status} score={visible_score}")
     print(f"TOTAL_SCORE {visible_score}")
     print(f"CASES_OK {cases_ok}")
