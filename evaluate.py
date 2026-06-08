@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
-"""Offline hidden-trend evaluator for the desensitized interface answer.
+"""Binary public evaluator for the coupled interface-response answer.
 
-This evaluator treats experimentally motivated observations as hidden
-validation targets:
-
-1. Q(alpha) = <v^2> decreases for alpha < 0.
-2. The Ca-like scalar response is internally consistent: the feedback-local
-   scalar decreases in the cascade that drives velocity, while the diagnostic
-   2D c(x, t) field rises near the center and falls near the edges.
-3. The 2D field shows the qualitative ground-truth redistribution pattern:
-   center and center-interface regions rise, edge and edge-interface regions
-   fall, and the center-edge contrast strengthens under negative alpha.
-
-The default candidate is ``desensitized_interface_response.py`` in the same
-directory.  Set SUBSTRATE_CANDIDATE=/path/to/file.py to evaluate another file.
+The public output is intentionally limited to PASS/FAIL in ``score_sum``
+format.  Internal continuous diagnostics are written only to a private JSONL
+path controlled by the judge backend and are never printed to stdout/stderr.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
@@ -31,17 +23,16 @@ from typing import Any
 import numpy as np
 
 
-RESULT_PREFIX = "EVALUATOR_FINAL_SCORE"
 DEFAULT_WEIGHTS = {
-    "q_drop": 10.0,
-    "feedback_drop": 8.0,
-    "center_rise": 35.0,
-    "edge_drop": 8.0,
-    "center_interface_rise": 14.0,
-    "edge_interface_drop": 6.0,
-    "center_edge_contrast": 8.0,
-    "center_edge_sign_split": 6.0,
-    "center_feedback_sign_split": 5.0,
+    "criterion_01": 10.0,
+    "criterion_02": 8.0,
+    "criterion_03": 35.0,
+    "criterion_04": 8.0,
+    "criterion_05": 14.0,
+    "criterion_06": 6.0,
+    "criterion_07": 8.0,
+    "criterion_08": 6.0,
+    "criterion_09": 5.0,
 }
 
 
@@ -98,17 +89,17 @@ def _region_mask(grid: Any, cfg: Any, region: str) -> np.ndarray | None:
         return np.asarray(grid.Z <= interface_depth)
     if region == "surface":
         return None
-    if region == "center":
+    if region == "zone_a":
         radius = float(getattr(cfg, "feature_radius", 10.0))
         return np.asarray(np.abs(grid.X) <= radius)
-    if region == "edge":
+    if region == "zone_b":
         half_width = float(getattr(cfg, "half_width", 50.0))
         return np.asarray(np.abs(grid.X) >= 0.70 * half_width)
-    if region == "center_interface":
+    if region == "zone_a_interface":
         radius = float(getattr(cfg, "feature_radius", 10.0))
         interface_depth = float(getattr(cfg, "interface_layer_depth", 2.0))
         return np.asarray((np.abs(grid.X) <= radius) & (grid.Z <= interface_depth))
-    if region == "edge_interface":
+    if region == "zone_b_interface":
         half_width = float(getattr(cfg, "half_width", 50.0))
         interface_depth = float(getattr(cfg, "interface_layer_depth", 2.0))
         return np.asarray((np.abs(grid.X) >= 0.70 * half_width) & (grid.Z <= interface_depth))
@@ -160,10 +151,10 @@ def _run_metrics(
         "feedback": [],
         "interface": [],
         "surface": [],
-        "center": [],
-        "edge": [],
-        "center_interface": [],
-        "edge_interface": [],
+        "zone_a": [],
+        "zone_b": [],
+        "zone_a_interface": [],
+        "zone_b_interface": [],
     }
 
     for raw_seed in seeds:
@@ -221,6 +212,61 @@ def _weighted_score(components: dict[str, dict[str, Any]]) -> tuple[float, int, 
     return float(earned), score, bool(passed)
 
 
+def _candidate_digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return "unavailable"
+
+
+def _scrub_private_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the private record useful without exposing model-specific names."""
+
+    components = result.get("score_components") or {}
+    scrubbed_components: dict[str, Any] = {}
+    for index, item in enumerate(components.values(), start=1):
+        scrubbed_components[f"criterion_{index:02d}"] = {
+            "passed": bool(item.get("passed", False)),
+            "weight": float(item.get("weight", 0.0)),
+            "observed": float(item.get("observed_relative_change", 0.0)),
+            "threshold": float(item.get("required_minimum", 0.0)),
+        }
+
+    private_metrics = result.get("metrics") or {}
+    return {
+        "candidate": result.get("candidate"),
+        "candidate_sha256": _candidate_digest(Path(str(result.get("candidate", "")))),
+        "raw_score": int(result.get("score", 0)),
+        "passed": bool(result.get("passed", False)),
+        "earned_weight": float(result.get("earned_weight", 0.0)),
+        "criteria": scrubbed_components,
+        "numeric_snapshot": {
+            "metric_01": float(private_metrics.get("metric_01_abs_rel", 0.0)),
+            "metric_02": float(private_metrics.get("metric_02_abs_rel", 0.0)),
+            "metric_03": float(private_metrics.get("metric_03", 0.0)),
+            "metric_04": float(private_metrics.get("metric_04_abs_rel", 0.0)),
+            "metric_05": float(private_metrics.get("metric_05", 0.0)),
+            "metric_06": float(private_metrics.get("metric_06_abs_rel", 0.0)),
+            "metric_07": float(private_metrics.get("metric_07_abs_rel", 0.0)),
+        },
+        "recorded_at": time.time(),
+    }
+
+
+def _write_private_score(result: dict[str, Any]) -> None:
+    path_text = os.environ.get("SUBSTRATE_PRIVATE_SCORE_PATH", "/tmp/substrate_private_scores.jsonl")
+    if not path_text:
+        return
+    path = Path(path_text)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(_scrub_private_result(result), sort_keys=True) + "\n")
+    except OSError:
+        # Private telemetry must never perturb visible grading.
+        pass
+
+
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     candidate = Path(os.environ.get("SUBSTRATE_CANDIDATE", args.candidate)).resolve()
     module = _load_candidate(candidate)
@@ -230,8 +276,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     master = np.random.default_rng(int(getattr(cfg, "seed", args.seed or 20260601)))
     seeds = master.integers(0, 2**32 - 1, size=int(args.trials), dtype=np.uint64)
 
-    zero = _run_metrics(module, cfg, args.alpha_zero, seeds, args.c_region)
-    negative = _run_metrics(module, cfg, args.alpha_negative, seeds, args.c_region)
+    zero = _run_metrics(module, cfg, args.condition_a, seeds, args.c_region)
+    negative = _run_metrics(module, cfg, args.condition_b, seeds, args.c_region)
 
     q_drop = zero["Q_mean"] - negative["Q_mean"]
     q_drop_rel = q_drop / max(abs(zero["Q_mean"]), 1.0e-12)
@@ -248,62 +294,62 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     feedback_decreases = feedback_drop_rel >= args.min_feedback_drop_rel
 
     center_rise = (
-        negative["cbar_by_region"]["center"] - zero["cbar_by_region"]["center"]
+        negative["cbar_by_region"]["zone_a"] - zero["cbar_by_region"]["zone_a"]
     )
-    center_rise_rel = center_rise / max(abs(zero["cbar_by_region"]["center"]), 1.0e-12)
+    center_rise_rel = center_rise / max(abs(zero["cbar_by_region"]["zone_a"]), 1.0e-12)
     edge_drop = (
-        zero["cbar_by_region"]["edge"] - negative["cbar_by_region"]["edge"]
+        zero["cbar_by_region"]["zone_b"] - negative["cbar_by_region"]["zone_b"]
     )
-    edge_drop_rel = edge_drop / max(abs(zero["cbar_by_region"]["edge"]), 1.0e-12)
+    edge_drop_rel = edge_drop / max(abs(zero["cbar_by_region"]["zone_b"]), 1.0e-12)
     center_increases = center_rise_rel >= args.min_center_rise_rel
     edge_decreases = edge_drop_rel >= args.min_edge_drop_rel
 
     center_interface_rise = (
-        negative["cbar_by_region"]["center_interface"]
-        - zero["cbar_by_region"]["center_interface"]
+        negative["cbar_by_region"]["zone_a_interface"]
+        - zero["cbar_by_region"]["zone_a_interface"]
     )
     center_interface_rise_rel = center_interface_rise / max(
-        abs(zero["cbar_by_region"]["center_interface"]), 1.0e-12
+        abs(zero["cbar_by_region"]["zone_a_interface"]), 1.0e-12
     )
     center_interface_increases = (
         center_interface_rise_rel >= args.min_center_interface_rise_rel
     )
 
     edge_interface_drop = (
-        zero["cbar_by_region"]["edge_interface"]
-        - negative["cbar_by_region"]["edge_interface"]
+        zero["cbar_by_region"]["zone_b_interface"]
+        - negative["cbar_by_region"]["zone_b_interface"]
     )
     edge_interface_drop_rel = edge_interface_drop / max(
-        abs(zero["cbar_by_region"]["edge_interface"]), 1.0e-12
+        abs(zero["cbar_by_region"]["zone_b_interface"]), 1.0e-12
     )
     edge_interface_decreases = (
         edge_interface_drop_rel >= args.min_edge_interface_drop_rel
     )
 
-    center_edge_contrast_zero = (
-        zero["cbar_by_region"]["center"] - zero["cbar_by_region"]["edge"]
+    metric_07_base_a = (
+        zero["cbar_by_region"]["zone_a"] - zero["cbar_by_region"]["zone_b"]
     )
-    center_edge_contrast_negative = (
-        negative["cbar_by_region"]["center"] - negative["cbar_by_region"]["edge"]
+    metric_07_base_b = (
+        negative["cbar_by_region"]["zone_a"] - negative["cbar_by_region"]["zone_b"]
     )
-    center_edge_contrast_gain = (
-        center_edge_contrast_negative - center_edge_contrast_zero
+    metric_07_abs = (
+        metric_07_base_b - metric_07_base_a
     )
-    center_edge_contrast_gain_rel = center_edge_contrast_gain / max(
-        abs(center_edge_contrast_zero), 1.0e-12
+    metric_07_abs_rel = metric_07_abs / max(
+        abs(metric_07_base_a), 1.0e-12
     )
     center_edge_contrast_increases = (
-        center_edge_contrast_gain_rel >= args.min_center_edge_contrast_gain_rel
+        metric_07_abs_rel >= args.min_metric_07_abs_rel
     )
 
     center_edge_sign_split = bool(center_increases and edge_decreases)
     center_feedback_sign_split = bool(center_increases and feedback_decreases)
 
-    if args.trend_mode == "feedback-decrease":
+    if args.trend_mode == "local-shift":
         concentration_check = feedback_decreases
-    elif args.trend_mode == "global-rise":
+    elif args.trend_mode == "global-shift":
         concentration_check = c_increases
-    elif args.trend_mode == "center-rise-edge-drop":
+    elif args.trend_mode == "zone-a-zone-b":
         concentration_check = bool(center_increases and edge_decreases)
     elif args.trend_mode == "both":
         concentration_check = bool(c_increases and center_increases and edge_decreases)
@@ -311,57 +357,57 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown trend mode: {args.trend_mode}")
 
     score_components = {
-        "Q_decreases_for_alpha_negative": {
-            "description": "Q(alpha)=<v^2> decreases when alpha is negative.",
+        "criterion_01": {
+            "description": "internal criterion",
             "weight": float(args.weight_q_drop),
             "passed": bool(q_decreases),
             "observed_relative_change": float(q_drop_rel),
             "required_minimum": float(args.min_q_drop_rel),
         },
-        "feedback_cbar_decreases_for_alpha_negative": {
-            "description": "Feedback-local Ca-like scalar decreases in the velocity feedback branch.",
+        "criterion_02": {
+            "description": "internal criterion",
             "weight": float(args.weight_feedback_drop),
             "passed": bool(feedback_decreases),
             "observed_relative_change": float(feedback_drop_rel),
             "required_minimum": float(args.min_feedback_drop_rel),
         },
-        "center_cbar_increases_for_alpha_negative": {
-            "description": "Diagnostic 2D c(x,t) increases in the center region.",
+        "criterion_03": {
+            "description": "internal criterion",
             "weight": float(args.weight_center_rise),
             "passed": bool(center_increases),
             "observed_relative_change": float(center_rise_rel),
             "required_minimum": float(args.min_center_rise_rel),
         },
-        "edge_cbar_decreases_for_alpha_negative": {
-            "description": "Diagnostic 2D c(x,t) decreases near the edges.",
+        "criterion_04": {
+            "description": "internal criterion",
             "weight": float(args.weight_edge_drop),
             "passed": bool(edge_decreases),
             "observed_relative_change": float(edge_drop_rel),
             "required_minimum": float(args.min_edge_drop_rel),
         },
-        "center_interface_cbar_increases_for_alpha_negative": {
-            "description": "Interface-proximal 2D c(x,t) increases in the center.",
+        "criterion_05": {
+            "description": "internal criterion",
             "weight": float(args.weight_center_interface_rise),
             "passed": bool(center_interface_increases),
             "observed_relative_change": float(center_interface_rise_rel),
             "required_minimum": float(args.min_center_interface_rise_rel),
         },
-        "edge_interface_cbar_decreases_for_alpha_negative": {
-            "description": "Interface-proximal 2D c(x,t) decreases near the edges.",
+        "criterion_06": {
+            "description": "internal criterion",
             "weight": float(args.weight_edge_interface_drop),
             "passed": bool(edge_interface_decreases),
             "observed_relative_change": float(edge_interface_drop_rel),
             "required_minimum": float(args.min_edge_interface_drop_rel),
         },
-        "center_edge_contrast_increases_for_alpha_negative": {
-            "description": "The center-minus-edge concentration contrast increases.",
+        "criterion_07": {
+            "description": "internal criterion",
             "weight": float(args.weight_center_edge_contrast),
             "passed": bool(center_edge_contrast_increases),
-            "observed_relative_change": float(center_edge_contrast_gain_rel),
-            "required_minimum": float(args.min_center_edge_contrast_gain_rel),
+            "observed_relative_change": float(metric_07_abs_rel),
+            "required_minimum": float(args.min_metric_07_abs_rel),
         },
-        "center_edge_sign_split_for_alpha_negative": {
-            "description": "Center concentration rises while edge concentration falls.",
+        "criterion_08": {
+            "description": "internal criterion",
             "weight": float(args.weight_center_edge_sign_split),
             "passed": bool(center_edge_sign_split),
             "observed_relative_change": float(min(center_rise_rel, edge_drop_rel)),
@@ -369,8 +415,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 min(args.min_center_rise_rel, args.min_edge_drop_rel)
             ),
         },
-        "center_feedback_sign_split_for_alpha_negative": {
-            "description": "Center concentration rises while feedback-local scalar falls.",
+        "criterion_09": {
+            "description": "internal criterion",
             "weight": float(args.weight_center_feedback_sign_split),
             "passed": bool(center_feedback_sign_split),
             "observed_relative_change": float(min(center_rise_rel, feedback_drop_rel)),
@@ -384,68 +430,68 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "candidate": str(candidate),
         "config": {
-            "alpha_zero": args.alpha_zero,
-            "alpha_negative": args.alpha_negative,
+            "condition_a": args.condition_a,
+            "condition_b": args.condition_b,
             "trials": args.trials,
             "duration": float(getattr(cfg, "t_total", args.duration)),
             "nx": int(getattr(cfg, "nx", args.nx)),
             "nz": int(getattr(cfg, "nz", args.nz)),
-            "concentration_region": args.c_region,
+            "diagnostic_region": args.c_region,
             "min_q_drop_rel": args.min_q_drop_rel,
             "min_c_rise_rel": args.min_c_rise_rel,
             "min_feedback_drop_rel": args.min_feedback_drop_rel,
-            "min_center_rise_rel": args.min_center_rise_rel,
-            "min_edge_drop_rel": args.min_edge_drop_rel,
-            "min_center_interface_rise_rel": args.min_center_interface_rise_rel,
-            "min_edge_interface_drop_rel": args.min_edge_interface_drop_rel,
-            "min_center_edge_contrast_gain_rel": args.min_center_edge_contrast_gain_rel,
+            "min_criterion_03": args.min_center_rise_rel,
+            "min_criterion_04": args.min_edge_drop_rel,
+            "min_criterion_05": args.min_center_interface_rise_rel,
+            "min_criterion_06": args.min_edge_interface_drop_rel,
+            "min_metric_07_abs_rel": args.min_metric_07_abs_rel,
             "trend_mode": args.trend_mode,
             "score_weights": {
-                "Q_decreases_for_alpha_negative": float(args.weight_q_drop),
-                "feedback_cbar_decreases_for_alpha_negative": float(args.weight_feedback_drop),
-                "center_cbar_increases_for_alpha_negative": float(args.weight_center_rise),
-                "edge_cbar_decreases_for_alpha_negative": float(args.weight_edge_drop),
-                "center_interface_cbar_increases_for_alpha_negative": float(args.weight_center_interface_rise),
-                "edge_interface_cbar_decreases_for_alpha_negative": float(args.weight_edge_interface_drop),
-                "center_edge_contrast_increases_for_alpha_negative": float(args.weight_center_edge_contrast),
-                "center_edge_sign_split_for_alpha_negative": float(args.weight_center_edge_sign_split),
-                "center_feedback_sign_split_for_alpha_negative": float(args.weight_center_feedback_sign_split),
+                "criterion_01": float(args.weight_q_drop),
+                "criterion_02": float(args.weight_feedback_drop),
+                "criterion_03": float(args.weight_center_rise),
+                "criterion_04": float(args.weight_edge_drop),
+                "criterion_05": float(args.weight_center_interface_rise),
+                "criterion_06": float(args.weight_edge_interface_drop),
+                "criterion_07": float(args.weight_center_edge_contrast),
+                "criterion_08": float(args.weight_center_edge_sign_split),
+                "criterion_09": float(args.weight_center_feedback_sign_split),
             },
         },
         "metrics": {
-            "alpha_zero": zero,
-            "alpha_negative": negative,
-            "Q_drop": float(q_drop),
-            "Q_drop_rel": float(q_drop_rel),
-            "cbar_rise": float(c_rise),
-            "cbar_rise_rel": float(c_rise_rel),
-            "feedback_cbar_drop": float(feedback_drop),
-            "feedback_cbar_drop_rel": float(feedback_drop_rel),
-            "center_cbar_rise": float(center_rise),
-            "center_cbar_rise_rel": float(center_rise_rel),
-            "edge_cbar_drop": float(edge_drop),
-            "edge_cbar_drop_rel": float(edge_drop_rel),
-            "center_interface_cbar_rise": float(center_interface_rise),
-            "center_interface_cbar_rise_rel": float(center_interface_rise_rel),
-            "edge_interface_cbar_drop": float(edge_interface_drop),
-            "edge_interface_cbar_drop_rel": float(edge_interface_drop_rel),
-            "center_edge_contrast_zero": float(center_edge_contrast_zero),
-            "center_edge_contrast_negative": float(center_edge_contrast_negative),
-            "center_edge_contrast_gain": float(center_edge_contrast_gain),
-            "center_edge_contrast_gain_rel": float(center_edge_contrast_gain_rel),
+            "condition_a": zero,
+            "condition_b": negative,
+            "metric_01_abs": float(q_drop),
+            "metric_01_abs_rel": float(q_drop_rel),
+            "metric_aux_abs": float(c_rise),
+            "metric_aux_abs_rel": float(c_rise_rel),
+            "metric_02_abs": float(feedback_drop),
+            "metric_02_abs_rel": float(feedback_drop_rel),
+            "metric_03_abs": float(center_rise),
+            "metric_03": float(center_rise_rel),
+            "metric_04_abs": float(edge_drop),
+            "metric_04_abs_rel": float(edge_drop_rel),
+            "metric_05_abs": float(center_interface_rise),
+            "metric_05": float(center_interface_rise_rel),
+            "metric_06_abs": float(edge_interface_drop),
+            "metric_06_abs_rel": float(edge_interface_drop_rel),
+            "metric_07_base_a": float(metric_07_base_a),
+            "metric_07_base_b": float(metric_07_base_b),
+            "metric_07_abs": float(metric_07_abs),
+            "metric_07_abs_rel": float(metric_07_abs_rel),
         },
         "checks": {
-            "Q_decreases_for_alpha_negative": bool(q_decreases),
-            "feedback_cbar_decreases_for_alpha_negative": bool(feedback_decreases),
-            "cbar_increases_for_alpha_negative": bool(c_increases),
-            "center_cbar_increases_for_alpha_negative": bool(center_increases),
-            "edge_cbar_decreases_for_alpha_negative": bool(edge_decreases),
-            "center_interface_cbar_increases_for_alpha_negative": bool(center_interface_increases),
-            "edge_interface_cbar_decreases_for_alpha_negative": bool(edge_interface_decreases),
-            "center_edge_contrast_increases_for_alpha_negative": bool(center_edge_contrast_increases),
-            "center_edge_sign_split_for_alpha_negative": bool(center_edge_sign_split),
-            "center_feedback_sign_split_for_alpha_negative": bool(center_feedback_sign_split),
-            "selected_concentration_trend_passed": bool(concentration_check),
+            "criterion_01": bool(q_decreases),
+            "criterion_02": bool(feedback_decreases),
+            "criterion_aux_01": bool(c_increases),
+            "criterion_03": bool(center_increases),
+            "criterion_04": bool(edge_decreases),
+            "criterion_05": bool(center_interface_increases),
+            "criterion_06": bool(edge_interface_decreases),
+            "criterion_07": bool(center_edge_contrast_increases),
+            "criterion_08": bool(center_edge_sign_split),
+            "criterion_09": bool(center_feedback_sign_split),
+            "criterion_selected": bool(concentration_check),
         },
         "score_components": score_components,
         "earned_weight": earned_weight,
@@ -458,8 +504,8 @@ def parse_args() -> argparse.Namespace:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", default=str(here / "desensitized_interface_response.py"))
-    parser.add_argument("--alpha-zero", type=float, default=0.0)
-    parser.add_argument("--alpha-negative", type=float, default=-0.001)
+    parser.add_argument("--alpha-zero", dest="condition_a", type=float, default=0.0)
+    parser.add_argument("--alpha-negative", dest="condition_b", type=float, default=-0.001)
     parser.add_argument("--trials", type=int, default=12)
     parser.add_argument("--duration", type=float, default=None)
     parser.add_argument("--nx", type=int, default=None)
@@ -468,13 +514,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--c-region",
-        choices=("full", "feedback", "interface", "surface", "center", "edge", "center_interface", "edge_interface"),
+        choices=("full", "feedback", "interface", "surface", "zone_a", "zone_b", "zone_a_interface", "zone_b_interface"),
         default="feedback",
     )
     parser.add_argument(
         "--trend-mode",
-        choices=("feedback-decrease", "global-rise", "center-rise-edge-drop", "both"),
-        default="feedback-decrease",
+        choices=("local-shift", "global-shift", "zone-a-zone-b", "both"),
+        default="local-shift",
         help="Diagnostic concentration trend to report; default scoring uses weighted components.",
     )
     parser.add_argument("--min-q-drop-rel", type=float, default=0.01)
@@ -484,16 +530,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-edge-drop-rel", type=float, default=0.001)
     parser.add_argument("--min-center-interface-rise-rel", type=float, default=0.001)
     parser.add_argument("--min-edge-interface-drop-rel", type=float, default=0.001)
-    parser.add_argument("--min-center-edge-contrast-gain-rel", type=float, default=0.01)
-    parser.add_argument("--weight-q-drop", type=float, default=DEFAULT_WEIGHTS["q_drop"])
-    parser.add_argument("--weight-feedback-drop", type=float, default=DEFAULT_WEIGHTS["feedback_drop"])
-    parser.add_argument("--weight-center-rise", type=float, default=DEFAULT_WEIGHTS["center_rise"])
-    parser.add_argument("--weight-edge-drop", type=float, default=DEFAULT_WEIGHTS["edge_drop"])
-    parser.add_argument("--weight-center-interface-rise", type=float, default=DEFAULT_WEIGHTS["center_interface_rise"])
-    parser.add_argument("--weight-edge-interface-drop", type=float, default=DEFAULT_WEIGHTS["edge_interface_drop"])
-    parser.add_argument("--weight-center-edge-contrast", type=float, default=DEFAULT_WEIGHTS["center_edge_contrast"])
-    parser.add_argument("--weight-center-edge-sign-split", type=float, default=DEFAULT_WEIGHTS["center_edge_sign_split"])
-    parser.add_argument("--weight-center-feedback-sign-split", type=float, default=DEFAULT_WEIGHTS["center_feedback_sign_split"])
+    parser.add_argument("--min-center-edge-contrast-gain-rel", dest="min_metric_07_abs_rel", type=float, default=0.01)
+    parser.add_argument("--weight-q-drop", type=float, default=DEFAULT_WEIGHTS["criterion_01"])
+    parser.add_argument("--weight-feedback-drop", type=float, default=DEFAULT_WEIGHTS["criterion_02"])
+    parser.add_argument("--weight-center-rise", type=float, default=DEFAULT_WEIGHTS["criterion_03"])
+    parser.add_argument("--weight-edge-drop", type=float, default=DEFAULT_WEIGHTS["criterion_04"])
+    parser.add_argument("--weight-center-interface-rise", type=float, default=DEFAULT_WEIGHTS["criterion_05"])
+    parser.add_argument("--weight-edge-interface-drop", type=float, default=DEFAULT_WEIGHTS["criterion_06"])
+    parser.add_argument("--weight-center-edge-contrast", type=float, default=DEFAULT_WEIGHTS["criterion_07"])
+    parser.add_argument("--weight-center-edge-sign-split", type=float, default=DEFAULT_WEIGHTS["criterion_08"])
+    parser.add_argument("--weight-center-feedback-sign-split", type=float, default=DEFAULT_WEIGHTS["criterion_09"])
     return parser.parse_args()
 
 
@@ -508,16 +554,20 @@ def main() -> int:
             "error": f"{type(exc).__name__}: {exc}",
         }
 
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
-    verdict = "PASS" if result.get("passed") else "FAIL"
-    score = int(result.get("score", 0))
+    _write_private_score(result)
+    passed = bool(result.get("passed"))
+    verdict = "PASS" if passed else "FAIL"
+    case_status = "OK" if passed else "WA"
+    visible_score = 1 if passed else 0
+    cases_ok = 1 if passed else 0
     print("=" * 40)
     print(f"RESULT: {verdict}")
-    print(f"Score: {score}/100")
-    print(f"TOTAL_SCORE {score}")
-    print(f"{RESULT_PREFIX}={score}/100")
+    print(f"CASE visible {case_status} score={visible_score}")
+    print(f"TOTAL_SCORE {visible_score}")
+    print(f"CASES_OK {cases_ok}")
+    print("CASES_TOTAL 1")
     print("=" * 40)
-    return 0 if result.get("passed") else 1
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
