@@ -9,6 +9,7 @@ path controlled by the judge backend and are never printed to stdout/stderr.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -33,7 +34,46 @@ DEFAULT_WEIGHTS = {
     "criterion_07": 8.0,
     "criterion_08": 6.0,
     "criterion_09": 5.0,
+    "criterion_10": 8.0,
+    "criterion_11": 8.0,
+    "criterion_12": 8.0,
+    "criterion_13": 8.0,
 }
+
+
+_TRUSTED_STDOUT = sys.stdout
+_TRUSTED_STDERR = sys.stderr
+
+
+@contextlib.contextmanager
+def _suppress_untrusted_output():
+    """Hide stdout/stderr produced while importing or running submissions."""
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    try:
+        with open(os.devnull, "wb") as devnull:
+            os.dup2(devnull.fileno(), 1)
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        sys.stdout = _TRUSTED_STDOUT
+        sys.stderr = _TRUSTED_STDERR
 
 
 def _load_candidate(path: Path) -> ModuleType:
@@ -103,7 +143,76 @@ def _region_mask(grid: Any, cfg: Any, region: str) -> np.ndarray | None:
         half_width = float(getattr(cfg, "half_width", 50.0))
         interface_depth = float(getattr(cfg, "interface_layer_depth", 2.0))
         return np.asarray((np.abs(grid.X) >= 0.70 * half_width) & (grid.Z <= interface_depth))
-    raise ValueError(f"unknown concentration region: {region}")
+    raise ValueError(f"unknown scalar region: {region}")
+
+
+def _field_structure_diagnostics(result: dict[str, Any], grid: Any, cfg: Any) -> dict[str, float]:
+    time = _finite_array(result["time"], "time").reshape(-1)
+    feedback = _finite_array(result["feedback_scalar"], "feedback_scalar").reshape(-1)
+    surface = _finite_array(result["scalar_surface_mean"], "scalar_surface_mean").reshape(-1)
+    scalar = result.get("scalar_samples")
+    if scalar is None:
+        raise ValueError("run_trial did not return scalar_samples; record_fields=True is required")
+
+    scalar_arr = _finite_array(scalar, "scalar_samples")
+    if scalar_arr.ndim != 3 or scalar_arr.shape[-1] != time.size:
+        raise ValueError("scalar_samples must have shape (nz, nx, nt)")
+    if feedback.size != time.size or surface.size != time.size:
+        raise ValueError("diagnostic time-series lengths must match time")
+
+    start = max(0, time.size // 2)
+    segment = scalar_arr[..., start:]
+    mean_field = np.mean(segment, axis=-1)
+    temporal_std = np.std(segment, axis=-1)
+    field_mean = float(np.mean(segment))
+    field_scale = max(abs(field_mean), 1.0e-12)
+    field_std_rel = float(np.std(segment) / field_scale)
+    temporal_activity_rel = float(np.mean(temporal_std) / field_scale)
+
+    if mean_field.shape[1] > 2:
+        first_x = np.mean(np.abs(np.diff(mean_field, axis=1)))
+        second_x = np.mean(np.abs(np.diff(mean_field, n=2, axis=1)))
+        roughness_ratio = float(second_x / max(first_x, 1.0e-12))
+    else:
+        roughness_ratio = 0.0
+
+    omega = float(getattr(cfg, "omega", 0.12))
+    t_segment = time[start:]
+    centered = segment - mean_field[..., None]
+    if t_segment.size >= 3:
+        kernel = np.exp(-1j * omega * t_segment)
+        harmonic = np.abs(
+            (2.0 / t_segment.size)
+            * np.tensordot(centered, kernel, axes=([-1], [0]))
+        )
+        harmonic_rel = float(np.mean(harmonic) / field_scale)
+    else:
+        harmonic_rel = 0.0
+
+    interface_depth = float(getattr(cfg, "interface_layer_depth", 2.0))
+    depth = float(getattr(cfg, "depth", np.max(grid.Z)))
+    interface_mask = np.asarray(grid.Z <= interface_depth)
+    deep_mask = np.asarray(grid.Z >= 0.70 * depth)
+    if interface_mask.shape != mean_field.shape or deep_mask.shape != mean_field.shape:
+        raise ValueError("grid shape does not match scalar_samples")
+    interface_deep_contrast_rel = float(
+        (np.mean(mean_field[interface_mask]) - np.mean(mean_field[deep_mask]))
+        / field_scale
+    )
+
+    local_surface_separation_rel = float(
+        np.mean(np.abs(feedback[start:] - surface[start:]))
+        / max(abs(float(np.mean(surface[start:]))), 1.0e-12)
+    )
+
+    return {
+        "field_std_rel": field_std_rel,
+        "temporal_activity_rel": temporal_activity_rel,
+        "roughness_ratio": roughness_ratio,
+        "harmonic_rel": harmonic_rel,
+        "interface_deep_contrast_rel": interface_deep_contrast_rel,
+        "local_surface_separation_rel": local_surface_separation_rel,
+    }
 
 
 def _mean_scalar_for_region(result: dict[str, Any], grid: Any, cfg: Any, region: str) -> float:
@@ -144,7 +253,8 @@ def _run_metrics(
     seeds: np.ndarray,
     primary_region: str,
 ) -> dict[str, Any]:
-    grid = module.make_grid(cfg)
+    with _suppress_untrusted_output():
+        grid = module.make_grid(cfg)
     q_values: list[float] = []
     region_values: dict[str, list[float]] = {
         "full": [],
@@ -156,10 +266,19 @@ def _run_metrics(
         "zone_a_interface": [],
         "zone_b_interface": [],
     }
+    field_diagnostics: dict[str, list[float]] = {
+        "field_std_rel": [],
+        "temporal_activity_rel": [],
+        "roughness_ratio": [],
+        "harmonic_rel": [],
+        "interface_deep_contrast_rel": [],
+        "local_surface_separation_rel": [],
+    }
 
     for raw_seed in seeds:
         rng = np.random.default_rng(int(raw_seed))
-        result = module.run_trial(float(alpha), cfg, grid, rng, record_fields=True)
+        with _suppress_untrusted_output():
+            result = module.run_trial(float(alpha), cfg, grid, rng, record_fields=True)
 
         time = _finite_array(result["time"], "time").reshape(-1)
         rate = _finite_array(result["rate"], "rate").reshape(-1)
@@ -170,6 +289,9 @@ def _run_metrics(
         q_values.append(float(np.mean(rate[start:] ** 2)))
         for region in region_values:
             region_values[region].append(_mean_scalar_for_region(result, grid, cfg, region))
+        diagnostics = _field_structure_diagnostics(result, grid, cfg)
+        for key, value in diagnostics.items():
+            field_diagnostics[key].append(float(value))
 
     q_arr = np.asarray(q_values, dtype=float)
     primary_arr = np.asarray(region_values[primary_region], dtype=float)
@@ -189,6 +311,10 @@ def _run_metrics(
         "cbar_sem": float(np.std(primary_arr, ddof=1) / np.sqrt(primary_arr.size)) if primary_arr.size > 1 else 0.0,
         "cbar_by_region": cbar_by_region,
         "cbar_sem_by_region": cbar_sem_by_region,
+        "field_diagnostics": {
+            key: float(np.mean(values))
+            for key, values in field_diagnostics.items()
+        },
         "n_trials": int(q_arr.size),
     }
 
@@ -239,6 +365,7 @@ def _scrub_private_result(result: dict[str, Any]) -> dict[str, Any]:
         "raw_score": int(result.get("score", 0)),
         "passed": bool(result.get("passed", False)),
         "earned_weight": float(result.get("earned_weight", 0.0)),
+        "error": result.get("error"),
         "criteria": scrubbed_components,
         "numeric_snapshot": {
             "metric_01": float(private_metrics.get("metric_01_abs_rel", 0.0)),
@@ -248,6 +375,10 @@ def _scrub_private_result(result: dict[str, Any]) -> dict[str, Any]:
             "metric_05": float(private_metrics.get("metric_05", 0.0)),
             "metric_06": float(private_metrics.get("metric_06_abs_rel", 0.0)),
             "metric_07": float(private_metrics.get("metric_07_abs_rel", 0.0)),
+            "metric_08": float(private_metrics.get("metric_08", 0.0)),
+            "metric_09": float(private_metrics.get("metric_09", 0.0)),
+            "metric_10": float(private_metrics.get("metric_10", 0.0)),
+            "metric_11": float(private_metrics.get("metric_11", 0.0)),
         },
         "recorded_at": time.time(),
     }
@@ -269,7 +400,8 @@ def _write_private_score(result: dict[str, Any]) -> None:
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     candidate = Path(os.environ.get("SUBSTRATE_CANDIDATE", args.candidate)).resolve()
-    module = _load_candidate(candidate)
+    with _suppress_untrusted_output():
+        module = _load_candidate(candidate)
     _require_api(module)
     cfg = _make_config(module, args)
 
@@ -344,15 +476,40 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
     center_edge_sign_split = bool(center_increases and edge_decreases)
     center_feedback_sign_split = bool(center_increases and feedback_decreases)
+    field_diag_zero = zero["field_diagnostics"]
+    field_diag_negative = negative["field_diagnostics"]
+    field_std_ok = (
+        field_diag_zero["field_std_rel"] >= args.min_field_std_rel
+        and field_diag_negative["field_std_rel"] >= args.min_field_std_rel
+        and field_diag_zero["roughness_ratio"] <= args.max_field_roughness_ratio
+        and field_diag_negative["roughness_ratio"] <= args.max_field_roughness_ratio
+    )
+    local_diagnostic_ok = (
+        field_diag_zero["local_surface_separation_rel"]
+        >= args.min_local_surface_separation_rel
+        and field_diag_negative["local_surface_separation_rel"]
+        >= args.min_local_surface_separation_rel
+    )
+    interface_structure_ok = (
+        field_diag_zero["interface_deep_contrast_rel"]
+        >= args.min_interface_depth_contrast_rel
+        and field_diag_negative["interface_deep_contrast_rel"]
+        >= args.min_interface_depth_contrast_rel
+    )
+    modulation_structure_ok = (
+        field_diag_negative["harmonic_rel"] >= args.min_harmonic_rel
+        and field_diag_negative["temporal_activity_rel"]
+        >= args.min_temporal_activity_rel
+    )
 
     if args.trend_mode == "local-shift":
-        concentration_check = feedback_decreases
+        scalar_check = feedback_decreases
     elif args.trend_mode == "global-shift":
-        concentration_check = c_increases
+        scalar_check = c_increases
     elif args.trend_mode == "zone-a-zone-b":
-        concentration_check = bool(center_increases and edge_decreases)
+        scalar_check = bool(center_increases and edge_decreases)
     elif args.trend_mode == "both":
-        concentration_check = bool(c_increases and center_increases and edge_decreases)
+        scalar_check = bool(c_increases and center_increases and edge_decreases)
     else:
         raise ValueError(f"unknown trend mode: {args.trend_mode}")
 
@@ -424,6 +581,46 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 min(args.min_center_rise_rel, args.min_feedback_drop_rel)
             ),
         },
+        "criterion_10": {
+            "description": "internal criterion",
+            "weight": float(args.weight_field_structure),
+            "passed": bool(field_std_ok),
+            "observed_relative_change": float(
+                min(field_diag_zero["field_std_rel"], field_diag_negative["field_std_rel"])
+            ),
+            "required_minimum": float(args.min_field_std_rel),
+        },
+        "criterion_11": {
+            "description": "internal criterion",
+            "weight": float(args.weight_local_diagnostic),
+            "passed": bool(local_diagnostic_ok),
+            "observed_relative_change": float(
+                min(
+                    field_diag_zero["local_surface_separation_rel"],
+                    field_diag_negative["local_surface_separation_rel"],
+                )
+            ),
+            "required_minimum": float(args.min_local_surface_separation_rel),
+        },
+        "criterion_12": {
+            "description": "internal criterion",
+            "weight": float(args.weight_interface_structure),
+            "passed": bool(interface_structure_ok),
+            "observed_relative_change": float(
+                min(
+                    field_diag_zero["interface_deep_contrast_rel"],
+                    field_diag_negative["interface_deep_contrast_rel"],
+                )
+            ),
+            "required_minimum": float(args.min_interface_depth_contrast_rel),
+        },
+        "criterion_13": {
+            "description": "internal criterion",
+            "weight": float(args.weight_modulation_structure),
+            "passed": bool(modulation_structure_ok),
+            "observed_relative_change": float(field_diag_negative["harmonic_rel"]),
+            "required_minimum": float(args.min_harmonic_rel),
+        },
     }
     earned_weight, score, passed = _weighted_score(score_components)
 
@@ -456,6 +653,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "criterion_07": float(args.weight_center_edge_contrast),
                 "criterion_08": float(args.weight_center_edge_sign_split),
                 "criterion_09": float(args.weight_center_feedback_sign_split),
+                "criterion_10": float(args.weight_field_structure),
+                "criterion_11": float(args.weight_local_diagnostic),
+                "criterion_12": float(args.weight_interface_structure),
+                "criterion_13": float(args.weight_modulation_structure),
             },
         },
         "metrics": {
@@ -479,6 +680,26 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "metric_07_base_b": float(metric_07_base_b),
             "metric_07_abs": float(metric_07_abs),
             "metric_07_abs_rel": float(metric_07_abs_rel),
+            "metric_08": float(
+                min(field_diag_zero["field_std_rel"], field_diag_negative["field_std_rel"])
+            ),
+            "metric_09": float(
+                min(
+                    field_diag_zero["local_surface_separation_rel"],
+                    field_diag_negative["local_surface_separation_rel"],
+                )
+            ),
+            "metric_10": float(
+                min(
+                    field_diag_zero["interface_deep_contrast_rel"],
+                    field_diag_negative["interface_deep_contrast_rel"],
+                )
+            ),
+            "metric_11": float(field_diag_negative["harmonic_rel"]),
+            "field_structure": {
+                "condition_a": field_diag_zero,
+                "condition_b": field_diag_negative,
+            },
         },
         "checks": {
             "criterion_01": bool(q_decreases),
@@ -491,7 +712,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "criterion_07": bool(center_edge_contrast_increases),
             "criterion_08": bool(center_edge_sign_split),
             "criterion_09": bool(center_feedback_sign_split),
-            "criterion_selected": bool(concentration_check),
+            "criterion_10": bool(field_std_ok),
+            "criterion_11": bool(local_diagnostic_ok),
+            "criterion_12": bool(interface_structure_ok),
+            "criterion_13": bool(modulation_structure_ok),
+            "criterion_selected": bool(scalar_check),
         },
         "score_components": score_components,
         "earned_weight": earned_weight,
@@ -521,7 +746,7 @@ def parse_args() -> argparse.Namespace:
         "--trend-mode",
         choices=("local-shift", "global-shift", "zone-a-zone-b", "both"),
         default="local-shift",
-        help="Diagnostic concentration trend to report; default scoring uses weighted components.",
+        help="Diagnostic scalar trend to report; default scoring uses weighted components.",
     )
     parser.add_argument("--min-q-drop-rel", type=float, default=0.01)
     parser.add_argument("--min-c-rise-rel", type=float, default=0.001)
@@ -531,6 +756,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-center-interface-rise-rel", type=float, default=0.001)
     parser.add_argument("--min-edge-interface-drop-rel", type=float, default=0.001)
     parser.add_argument("--min-center-edge-contrast-gain-rel", dest="min_metric_07_abs_rel", type=float, default=0.01)
+    parser.add_argument("--min-field-std-rel", type=float, default=0.02)
+    parser.add_argument("--max-field-roughness-ratio", type=float, default=0.85)
+    parser.add_argument("--min-local-surface-separation-rel", type=float, default=0.05)
+    parser.add_argument("--min-interface-depth-contrast-rel", type=float, default=0.10)
+    parser.add_argument("--min-harmonic-rel", type=float, default=1.0e-4)
+    parser.add_argument("--min-temporal-activity-rel", type=float, default=1.0e-4)
     parser.add_argument("--weight-q-drop", type=float, default=DEFAULT_WEIGHTS["criterion_01"])
     parser.add_argument("--weight-feedback-drop", type=float, default=DEFAULT_WEIGHTS["criterion_02"])
     parser.add_argument("--weight-center-rise", type=float, default=DEFAULT_WEIGHTS["criterion_03"])
@@ -540,6 +771,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-center-edge-contrast", type=float, default=DEFAULT_WEIGHTS["criterion_07"])
     parser.add_argument("--weight-center-edge-sign-split", type=float, default=DEFAULT_WEIGHTS["criterion_08"])
     parser.add_argument("--weight-center-feedback-sign-split", type=float, default=DEFAULT_WEIGHTS["criterion_09"])
+    parser.add_argument("--weight-field-structure", type=float, default=DEFAULT_WEIGHTS["criterion_10"])
+    parser.add_argument("--weight-local-diagnostic", type=float, default=DEFAULT_WEIGHTS["criterion_11"])
+    parser.add_argument("--weight-interface-structure", type=float, default=DEFAULT_WEIGHTS["criterion_12"])
+    parser.add_argument("--weight-modulation-structure", type=float, default=DEFAULT_WEIGHTS["criterion_13"])
     return parser.parse_args()
 
 
@@ -571,4 +806,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(exit_code)
